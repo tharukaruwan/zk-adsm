@@ -2,85 +2,77 @@ const express = require("express");
 const app = express();
 const PORT = 8081;
 
+// Capture raw text - critical for ZK protocol
 app.use(express.text({ type: "*/*" }));
 
 // ---------------------------------------------------------
-// DATABASE SIMULATION (Replace with MySQL/MongoDB later)
+// DATABASE SIMULATION
 // ---------------------------------------------------------
-let devices = {};       // Stores { SN: { lastSeen: Date, status: 'online' } }
-let commandQueue = {};  // Stores { SN: [ 'command1', 'command2' ] }
+let devices = {};       
+let commandQueue = {};  
 
-// ---------------------------------------------------------
-// 1. DEVICE HEALTH & LAST SEEN TRACKER
-// ---------------------------------------------------------
 const updateDeviceHealth = (sn) => {
+    if (!sn) return;
+    const now = new Date();
     devices[sn] = {
-        lastSeen: new Date().toLocaleString(),
-        status: "Online"
+        lastSeen: now.toLocaleString(),
+        status: "Online",
+        timestamp: now.getTime()
     };
 };
 
 // ---------------------------------------------------------
-// 2. REGISTRY HANDLER (Initial Connection)
+// 1. REGISTRY HANDLER
 // ---------------------------------------------------------
 app.post("/iclock/registry", (req, res) => {
     const { SN } = req.query;
     console.log(`📝 Registry Request from SN: ${SN}`);
     updateDeviceHealth(SN);
-    
     res.set("Content-Type", "text/plain");
     res.send("RegistryCode=OK\n"); 
 });
 
 // ---------------------------------------------------------
-// 3. ATTENDANCE TRACKER (Online & Offline Logs)
+// 2. ATTENDANCE TRACKER (Online & Offline)
 // ---------------------------------------------------------
 app.post("/iclock/cdata", (req, res) => {
     const { SN, table } = req.query;
     updateDeviceHealth(SN);
 
-    // table=rtlog is live punch | table=ATTLOG is offline logs being synced
     if (table === "rtlog" || table === "ATTLOG") {
-        const rawData = req.body.trim();
+        const rawData = req.body ? req.body.trim() : "";
         const lines = rawData.split("\n");
 
         lines.forEach(line => {
+            if (!line) return;
             const dataObj = {};
             line.split("\t").forEach(pair => {
                 const [key, value] = pair.split("=");
                 if (key && value) dataObj[key] = value;
             });
 
-            // Tracking details: PIN, Time, and Device SN
-            const punch = {
-                userId: dataObj.pin || "Unknown",
-                time: dataObj.time || "No Time",
-                sn: SN,
-                mode: table === "rtlog" ? "Real-time" : "Sync (Offline Log)"
-            };
-
-            console.log(`✅ [${punch.mode}] User ${punch.userId} entered at ${punch.time}`);
+            console.log(`✅ [${table}] User ${dataObj.pin || '??'} entered at ${dataObj.time || '??'}`);
         });
     }
-
     res.set("Content-Type", "text/plain");
     res.send("OK\n");
 });
 
 // ---------------------------------------------------------
-// 4. COMMAND POLLING (Manage Members / Configs)
+// 3. COMMAND POLLING (GET) - Device asks for commands
 // ---------------------------------------------------------
 app.get("/iclock/getrequest", (req, res) => {
-    console.log('req.query = ', req.query);
-    console.log('req.body = ', req.body);
     const { SN } = req.query;
     updateDeviceHealth(SN);
+    
+    // Log heartbeat
+    console.log(`💓 Heartbeat from ${SN} at ${new Date().toLocaleTimeString()}`);
+    
     res.set("Content-Type", "text/plain");
 
-    // Check if there are commands for this specific device
     if (commandQueue[SN] && commandQueue[SN].length > 0) {
         const cmd = commandQueue[SN].shift();
-        console.log(`🚀 Sending Command to ${SN}: ${cmd}`);
+        console.log(`🚀 Sending Command to ${SN}: ${cmd.replace(/\t/g, '[TAB]')}`);
         return res.send(cmd + "\n");
     }
 
@@ -88,102 +80,169 @@ app.get("/iclock/getrequest", (req, res) => {
 });
 
 // ---------------------------------------------------------
-// 5. MEMBER MANAGEMENT & CONFIGURATION API
+// 4. COMMAND RESULT HANDLER (POST) - Device confirms execution
+// ---------------------------------------------------------
+app.post("/iclock/getrequest", (req, res) => {
+    const { SN } = req.query;
+    updateDeviceHealth(SN);
+    
+    const result = req.body ? req.body.trim() : "";
+    console.log(`🎯 Device ${SN} execution result: ${result}`);
+    
+    // Parse the result to check if successful
+    if (result.includes("Return=0")) {
+        console.log("✅ Command executed successfully!");
+    } else if (result.includes("Return=")) {
+        console.log("⚠️  Command execution failed or returned error");
+    }
+    
+    res.set("Content-Type", "text/plain");
+    res.send("OK\n");
+});
+
+// ---------------------------------------------------------
+// 5. MEMBER MANAGEMENT API (FIXED VERSION)
 // ---------------------------------------------------------
 
-/**
- * MEMBER REGISTRATION ENDPOINT
- * This handles your requirement #3: Adding/Updating members.
- * * URL: /add-member?sn=NYU7253200164&id=101&name=Saman
- */
 app.get("/add-member", (req, res) => {
-    const { sn, id, name } = req.query;
-
-    if (!sn || !id || !name) {
-        return res.status(400).send("Missing parameters: sn, id, or name");
-    }
+    const { sn, id, name, card = "" } = req.query;
+    if (!sn || !id || !name) return res.status(400).send("Missing sn, id, or name");
 
     const cmdId = Math.floor(Math.random() * 10000);
     
-    // Command String:
-    // PIN  = The unique ID
-    // Name = The Display Name
-    // Pri  = 0 (Normal User)
-    // Grp  = 1 (Default Group)
-    const cmd = `C:${cmdId}:DATA USER PIN=${id}\tName=${name}\tPri=0\tGrp=1`;
+    // CRITICAL FIX: Some devices need the command WITHOUT the "C:" prefix
+    // Try this format first - it's more compatible with ZKTeco devices
+    const fields = [
+        `DATA USER PIN=${id}`,
+        `Name=${name}`,
+        `Pri=0`,
+        `Passwd=`,
+        `Card=${card}`,
+        `Grp=1`,
+        `TZ=0000000000000000`,
+        `Verify=0`
+    ];
+
+    const cmd = fields.join("\t");
 
     if (!commandQueue[sn]) commandQueue[sn] = [];
     commandQueue[sn].push(cmd);
 
-    console.log(`👤 MEMBER QUEUED: ${name} (ID: ${id}) for Device ${sn}`);
-    res.send(`Member ${name} queued. Device will sync on next 5s heartbeat.`);
+    console.log(`👤 MEMBER QUEUED: ${name} (ID: ${id}) for device ${sn}`);
+    res.send(`User ${name} (ID: ${id}) queued for ${sn}. Device will receive on next poll.`);
 });
 
-/**
- * DELETE MEMBER
- * Example: /delete-member?sn=YOUR_SN&id=101
- */
+// Alternative format with C: prefix (try this if above doesn't work)
+app.get("/add-member-alt", (req, res) => {
+    const { sn, id, name, card = "" } = req.query;
+    if (!sn || !id || !name) return res.status(400).send("Missing sn, id, or name");
+
+    const cmdId = Math.floor(Math.random() * 10000);
+    
+    const cmd = `C:${cmdId}:DATA USER PIN=${id}\tName=${name}\tPri=0\tPasswd=\tCard=${card}\tGrp=1\tTZ=0000000000000000\tVerify=0`;
+
+    if (!commandQueue[sn]) commandQueue[sn] = [];
+    commandQueue[sn].push(cmd);
+
+    console.log(`👤 MEMBER QUEUED (ALT): ${name} (ID: ${id})`);
+    res.send(`User ${name} queued with C: prefix format`);
+});
+
 app.get("/delete-member", (req, res) => {
     const { sn, id } = req.query;
-    const cmdId = Math.floor(Math.random() * 10000);
+    if (!sn || !id) return res.status(400).send("Missing sn or id");
     
-    const cmd = `C:${cmdId}:DATA DELETE USER PIN=${id}`;
+    const cmd = `DATA DELETE USER PIN=${id}`;
     
     if (!commandQueue[sn]) commandQueue[sn] = [];
     commandQueue[sn].push(cmd);
-    res.send(`User ID ${id} queued for deletion from ${sn}`);
+    
+    console.log(`🗑️  DELETE QUEUED: ID ${id} from ${sn}`);
+    res.send(`Delete ID ${id} queued for ${sn}`);
 });
 
-/**
- * VIEW DEVICE HEALTH
- */
-app.get("/health", (req, res) => {
-    res.json(devices);
+// Query existing users (device will send them back)
+app.get("/query-users", (req, res) => {
+    const { sn } = req.query;
+    if (!sn) return res.status(400).send("Missing sn");
+    
+    const cmd = "DATA QUERY USER";
+    
+    if (!commandQueue[sn]) commandQueue[sn] = [];
+    commandQueue[sn].push(cmd);
+    
+    console.log(`🔍 QUERY USERS queued for ${sn}`);
+    res.send(`Query users command sent to ${sn}. Check server logs for response.`);
 });
 
 // ---------------------------------------------------------
-// CONFIGURATION HANDLER (Updated for 5-second health check)
+// 6. CONFIGURATION HANDLER (HANDSHAKE)
 // ---------------------------------------------------------
 app.get("/iclock/cdata", (req, res) => {
     const { SN, options } = req.query;
-    console.log(`⚙️ Configuration Request from SN: ${SN} with options: ${options}`);
     updateDeviceHealth(SN);
 
     if (options === "all") {
-        console.log(`⚙️ Setting heartbeat to 5 seconds for SN: ${SN}`);
+        console.log(`⚙️  Configuration request from ${SN}`);
         const now = Math.floor(Date.now() / 1000);
         
         const config = [
             `GET OPTION FROM: ${SN}`,
             `Stamp=${now}`,
             `OpStamp=${now}`,
-            `Realtime=1`,
-            `Delay=5`,          // <--- Changed from 30 to 5 (Heartbeat frequency)
-            `TransInterval=1`,  // <--- Send logs immediately
-            `ErrorDelay=5`,     // <--- Retry quickly if a connection fails
+            `ErrorDelay=30`,
+            `Delay=5`,
+            `TransInterval=1`,
             `TransFlag=1111000000`,
-            `Encrypt=0`
+            `Realtime=1`,
+            `Encrypt=0`,
+            `ServerVer=3.4.1`,
+            `PushVer=3.2.1`,
+            `ADMSVer=1.0.0`
         ].join("\r\n") + "\r\n";
 
         res.set("Content-Type", "text/plain");
         return res.send(config);
     }
-    res.send("OK\n");
-});
-
-// ---------------------------------------------------------
-// COMMAND RESULT HANDLER
-// The device POSTs here to say "I finished command C:3254"
-// ---------------------------------------------------------
-app.post("/iclock/getrequest", (req, res) => {
-    const { SN } = req.query;
-    console.log(`🎯 Device ${SN} reports command execution result:`);
-    console.log(req.body); // This should show "ID=3254&Return=0"
     
     res.set("Content-Type", "text/plain");
     res.send("OK\n");
 });
 
+// ---------------------------------------------------------
+// HEALTH & DEBUG ENDPOINTS
+// ---------------------------------------------------------
+app.get("/health", (req, res) => {
+    res.json({
+        devices,
+        commandQueue,
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.get("/queue-status", (req, res) => {
+    const { sn } = req.query;
+    if (sn) {
+        res.json({
+            device: sn,
+            queueLength: commandQueue[sn] ? commandQueue[sn].length : 0,
+            pendingCommands: commandQueue[sn] || []
+        });
+    } else {
+        res.json(commandQueue);
+    }
+});
+
+// ---------------------------------------------------------
+// START SERVER
+// ---------------------------------------------------------
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Fitrobit Server online at http://localhost:${PORT}`);
+    console.log(`📡 Waiting for device connections...`);
+    console.log(`\nAPI Endpoints:`);
+    console.log(`  - Add user: http://localhost:${PORT}/add-member?sn=DEVICE_SN&id=USER_ID&name=USER_NAME`);
+    console.log(`  - Delete user: http://localhost:${PORT}/delete-member?sn=DEVICE_SN&id=USER_ID`);
+    console.log(`  - Query users: http://localhost:${PORT}/query-users?sn=DEVICE_SN`);
+    console.log(`  - Health check: http://localhost:${PORT}/health`);
+    console.log(`  - Queue status: http://localhost:${PORT}/queue-status?sn=DEVICE_SN\n`);
 });
