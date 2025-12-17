@@ -171,6 +171,19 @@ app.get("/iclock/cdata", (req, res) => {
     res.send("OK\n");
 });
 
+// ---------------------------------------------------------
+// COMMAND RESULT HANDLER
+// The device POSTs here to say "I finished command C:3254"
+// ---------------------------------------------------------
+app.post("/iclock/getrequest", (req, res) => {
+    const { SN } = req.query;
+    console.log(`🎯 Device ${SN} reports command execution result:`);
+    console.log(req.body); // This should show "ID=3254&Return=0"
+    
+    res.set("Content-Type", "text/plain");
+    res.send("OK\n");
+});
+
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Fitrobit Server online at http://localhost:${PORT}`);
 });
