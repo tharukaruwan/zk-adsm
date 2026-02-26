@@ -30,6 +30,7 @@ app.post("/iclock/registry", (req, res) => {
 // 2. DATA HANDLER (Document Chapter 3.2 & 3.3)
 // ---------------------------------------------------------
 app.post("/iclock/cdata", (req, res) => {
+    console.log('req.query = ', req.query);
     const { SN, table } = req.query;
     updateDeviceHealth(SN);
 
@@ -47,6 +48,22 @@ app.post("/iclock/cdata", (req, res) => {
             console.log(`✅ [${table}] User ${dataObj.pin || '??'} at ${dataObj.time || '??'}`);
         });
     }
+
+    if (table === "OPERLOG") {
+        const lines = req.body.trim().split("\n");
+        lines.forEach(line => {
+            const parts = line.split(/\s+/); // Split by space/tabs
+            const opType = parts[1];
+            const targetPin = parts[5]; // Value1 in Appendix 4 is usually the User ID
+            
+            if (opType === "30") {
+                console.log(`🎊 CONFIRMED: Device ${SN} successfully created User ID: ${targetPin}`);
+            }
+        });
+        // Protocol requirement: Respond with record count
+        return res.send(`OK: ${lines.length}\n`);
+    }
+
     res.set("Content-Type", "text/plain");
     res.send("OK\n");
 });
