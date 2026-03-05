@@ -117,10 +117,28 @@ const parseEventLine = (line = "") => {
     return obj;
 };
 
-/** Queue one command (fields joined with \t per ZK protocol) */
-const enqueue = (sn, ...fields) => {
+/**
+ * Queue one command string as-is onto the device queue.
+ * Callers are responsible for correct ZK protocol formatting:
+ *   Line 1:  C:<CmdID>:<VERB> <first key>=<val>\t<key>=<val>...\r\n
+ *   Line 2+: <key>=<val>\t<key>=<val>...\r\n   (continuation records)
+ */
+const enqueue = (sn, cmd) => {
     if (!devices[sn]) devices[sn] = initDevice(sn);
-    devices[sn].cmdQueue.push(fields.join("\t"));
+    devices[sn].cmdQueue.push(cmd);
+};
+
+/**
+ * Convert door number(s) to AuthorizeDoorId bitmask.
+ * Java ref: authSum += Math.pow(2, doorNo - 1)
+ * Door 1 → 1, Door 2 → 2, Door 3 → 4, Door 1+2 → 3, Door 1+2+3 → 7
+ * @param {string|number|number[]} doors  e.g. "1", "1,2", [1,3]
+ */
+const calcDoorBitmask = (doors) => {
+    const nums = Array.isArray(doors)
+        ? doors
+        : String(doors).split(",").map(d => parseInt(d.trim())).filter(Boolean);
+    return nums.reduce((sum, d) => sum + Math.pow(2, d - 1), 0);
 };
 
 // Mark devices offline after 90s of silence
@@ -554,33 +572,60 @@ app.post("/iclock/cdata", (req, res) => {
 // =========================================================
 
 // ── Add member (user + access rights) ───────────────────
+// Java ref: AuthorityServlet.java — DATA UPDATE user / DATA UPDATE userauthorize
+// Field names from Java: CardNo, Pin, Password, Group, StartTime, EndTime, Name, SuperAuthorize, Disable
+// AuthorizeDoorId is a BITMASK: door1=1, door2=2, door3=4, door1+2=3 etc.
 app.get("/add-member", (req, res) => {
-    const { sn, id, name, timezone, door } = req.query;
+    const { sn, id, name, card, password, timezone, door, startTime, endTime, superAuth, disable } = req.query;
     if (!sn || !id || !name) return res.status(400).json({ error: "Missing: sn, id, name" });
 
-    const tzId   = timezone || "1";
-    const doorId = door     || "1";
-    const cid1   = getNextCmdId();
-    const cid2   = getNextCmdId();
+    const tzId      = timezone   || "1";
+    const doorMask  = calcDoorBitmask(door || "1");  // bitmask, not raw door number
+    const cid1      = getNextCmdId();
+    const cid2      = getNextCmdId();
+    const cid3      = getNextCmdId();
 
-    enqueue(sn,
+    // Command 1: Create/update user record
+    // Java format: DATA UPDATE user CardNo=X\tPin=X\tPassword=X\tGroup=0\tStartTime=0\tEndTime=0\tName=X\tSuperAuthorize=0\tDisable=0\r\n
+    const cmdUser = [
         `C:${cid1}:DATA UPDATE user`,
-        `PIN=${id}`, `Name=${name}`, `Pri=0`, `Passwd=`,
-        `Card=`, `Grp=1`, `TZ=${tzId}`, `Verify=-1`,
-        `ViceCard=`, `StartDatetime=0`, `EndDatetime=0`
-    );
-    enqueue(sn,
-        `C:${cid2}:DATA UPDATE userauthorize`,
-        `PIN=${id}`, `AuthorizeTimezoneId=${tzId}`, `AuthorizeDoorId=${doorId}`
-    );
+        `CardNo=${card || ""}`,
+        `Pin=${id}`,
+        `Password=${password || ""}`,
+        `Group=0`,
+        `StartTime=${startTime || "0"}`,
+        `EndTime=${endTime || "0"}`,
+        `Name=${name}`,
+        `SuperAuthorize=${superAuth || "0"}`,
+        `Disable=${disable || "0"}`,
+    ].join("\t") + "\r\n";
 
-    console.log(`✅ [add-member] SN=${sn} PIN=${id} Name=${name} TZ=${tzId} Door=${doorId}`);
-    res.json({ status: "queued", pin: id, name, cmdIds: [cid1, cid2] });
+    // Command 2: Assign timezone rule to device
+    // Java always issues the timezone rule before userauthorize
+    const tzMap = { TimezoneId: tzId };
+    const cmdTimezone = buildTimezoneCmd(cid2, tzId, tzMap);
+
+    // Command 3: Assign access rights
+    // Java format: DATA UPDATE userauthorize Pin=X\tAuthorizeTimezoneId=X\tAuthorizeDoorId=X\r\n
+    const cmdAuth = [
+        `C:${cid3}:DATA UPDATE userauthorize`,
+        `Pin=${id}`,
+        `AuthorizeTimezoneId=${tzId}`,
+        `AuthorizeDoorId=${doorMask}`,
+    ].join("\t") + "\r\n";
+
+    enqueue(sn, cmdUser);
+    enqueue(sn, cmdTimezone);
+    enqueue(sn, cmdAuth);
+
+    console.log(`✅ [add-member] SN=${sn} PIN=${id} Name=${name} TZ=${tzId} Doors=${door||1} DoorMask=${doorMask}`);
+    res.json({ status: "queued", pin: id, name, doorMask, cmdIds: [cid1, cid2, cid3] });
 });
 
 
 // ── Delete member ─────────────────────────────────────────
 // Doc 2.2: MUST delete userauthorize BEFORE user record
+// Java: "DATA DELETE userauthorize Pin=X\r\n" then "DATA DELETE user Pin=X\r\n"
 app.get("/delete-member", (req, res) => {
     const { sn, id } = req.query;
     if (!sn || !id) return res.status(400).json({ error: "Missing: sn, id" });
@@ -588,8 +633,13 @@ app.get("/delete-member", (req, res) => {
     const cid1 = getNextCmdId();
     const cid2 = getNextCmdId();
 
-    enqueue(sn, `C:${cid1}:DATA DELETE userauthorize`, `PIN=${id}`);
-    enqueue(sn, `C:${cid2}:DATA DELETE user`,          `PIN=${id}`);
+    // Step 1: remove access rights first
+    const cmdDelAuth = `C:${cid1}:DATA DELETE userauthorize\tPin=${id}\r\n`;
+    // Step 2: then delete user record
+    const cmdDelUser = `C:${cid2}:DATA DELETE user\tPin=${id}\r\n`;
+
+    enqueue(sn, cmdDelAuth);
+    enqueue(sn, cmdDelUser);
 
     console.log(`🗑️  [delete-member] SN=${sn} PIN=${id}`);
     res.json({ status: "queued", pin: id, cmdIds: [cid1, cid2] });
@@ -602,44 +652,86 @@ app.get("/update-timezone", (req, res) => {
     const { sn, id, timezone, door } = req.query;
     if (!sn || !id || !timezone) return res.status(400).json({ error: "Missing: sn, id, timezone" });
 
-    const doorId = door || "1";
-    const cid1   = getNextCmdId();
-    const cid2   = getNextCmdId();
+    const doorMask = calcDoorBitmask(door || "1");
+    const cid1     = getNextCmdId();
+    const cid2     = getNextCmdId();
 
     // Step 1: delete existing access rights
-    enqueue(sn, `C:${cid1}:DATA DELETE userauthorize`, `PIN=${id}`);
-    // Step 2: assign new timezone
-    enqueue(sn,
+    const cmdDel  = `C:${cid1}:DATA DELETE userauthorize\tPin=${id}\r\n`;
+    // Step 2: assign new timezone with bitmask door
+    const cmdAuth = [
         `C:${cid2}:DATA UPDATE userauthorize`,
-        `PIN=${id}`, `AuthorizeTimezoneId=${timezone}`, `AuthorizeDoorId=${doorId}`
-    );
+        `Pin=${id}`,
+        `AuthorizeTimezoneId=${timezone}`,
+        `AuthorizeDoorId=${doorMask}`,
+    ].join("\t") + "\r\n";
 
-    console.log(`🕐 [update-timezone] SN=${sn} PIN=${id} → TZ=${timezone}`);
-    res.json({ status: "queued", pin: id, timezone, cmdIds: [cid1, cid2] });
+    enqueue(sn, cmdDel);
+    enqueue(sn, cmdAuth);
+
+    console.log(`🕐 [update-timezone] SN=${sn} PIN=${id} → TZ=${timezone} DoorMask=${doorMask}`);
+    res.json({ status: "queued", pin: id, timezone, doorMask, cmdIds: [cid1, cid2] });
 });
 
 
 // ── Set timezone rule ─────────────────────────────────────
-// Doc 2.1.2: time = (startHHMM * 65536) | endHHMM
-// e.g. 08:30 to 18:00 → (830 * 65536) + 1800 = 54397000
+// Java ref: calculateTime(start, end) = ((startHH*100+startMM) << 16) | (endHH*100+endMM)
+// Supports 3 time slots per day + 3 holiday groups (Hol1/2/3), matching Java timezoneCmd()
+const calculateTime = (start, end) => {
+    if (!start || !end) return 0;
+    const [sh, sm] = start.split(":").map(Number);
+    const [eh, em] = end.split(":").map(Number);
+    return ((sh * 100 + sm) << 16) | (eh * 100 + em);
+};
+
+/**
+ * Build a full timezone command string as the Java reference does.
+ * Supports all 3 slots per day (Time1/Time2/Time3) + Hol1/2/3.
+ * @param {number}  cid   CmdID
+ * @param {string}  tzId  TimezoneId
+ * @param {Object}  slots { MonTime1: [start,end], MonTime2: [...], ... }
+ *                        OR simple { start:"08:00", end:"18:00" } for single-slot shorthand
+ */
+const buildTimezoneCmd = (cid, tzId, slots = {}) => {
+    const days  = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    const hols  = ["Hol1","Hol2","Hol3"];
+    const all   = [...days, ...hols];
+
+    const defaultStart = slots.start || "00:00";
+    const defaultEnd   = slots.end   || "23:59";
+
+    const parts = [`C:${cid}:DATA UPDATE timezone`, `TimezoneId=${tzId}`];
+
+    all.forEach(day => {
+        for (let i = 1; i <= 3; i++) {
+            const key   = `${day}Time${i}`;
+            const entry = slots[key];  // expects [start, end] or undefined
+            let val;
+            if (Array.isArray(entry)) {
+                val = calculateTime(entry[0], entry[1]);
+            } else if (i === 1 && !slots.start === false) {
+                // slot 1 gets default full-day, slots 2/3 get 0 (disabled)
+                val = calculateTime(defaultStart, defaultEnd);
+            } else {
+                val = 0;
+            }
+            parts.push(`${key}=${val}`);
+        }
+    });
+
+    return parts.join("\t") + "\r\n";
+};
+
 app.get("/set-timezone", (req, res) => {
     const { sn, tzid, start, end } = req.query;
     if (!sn || !tzid) return res.status(400).json({ error: "Missing: sn, tzid" });
 
-    const sVal = start ? parseInt(start.replace(":", "")) : 0;
-    const eVal = end   ? parseInt(end.replace(":", ""))   : 2359;
-    const code = sVal * 65536 + eVal;
-
     const cid = getNextCmdId();
-    enqueue(sn,
-        `C:${cid}:DATA UPDATE timezone`,
-        `TimezoneId=${tzid}`,
-        `MonTime1=${code}`, `TueTime1=${code}`,
-        `WedTime1=${code}`, `ThuTime1=${code}`,
-        `FriTime1=${code}`, `SatTime1=0`, `SunTime1=0`
-    );
+    const cmd = buildTimezoneCmd(cid, tzid, { start: start || "00:00", end: end || "23:59" });
+    enqueue(sn, cmd);
 
-    res.json({ status: "queued", cmdId: cid, tzid, timeCode: code });
+    const timeCode = calculateTime(start || "00:00", end || "23:59");
+    res.json({ status: "queued", cmdId: cid, tzid, timeCode });
 });
 
 
@@ -650,12 +742,16 @@ app.get("/issue-photo", (req, res) => {
     if (!sn || !id || !url) return res.status(400).json({ error: "Missing: sn, id, url" });
 
     const cid = getNextCmdId();
-    enqueue(sn,
-        `C:${cid}:DATA UPDATE biophoto`,
-        `Pin=${id}`, `FileName=${id}.jpg`,
-        `Type=9`,       // doc: MUST be 9 when server issues photo
-        `Size=${size || 0}`, `Url=${url}`
-    );
+    const cmd = [
+        `C:${cid}:DATA UPDATE BIOPHOTO`,
+        `PIN=${id}`,
+        `Type=9`,
+        `Size=${size || 0}`,
+        `Content=`,
+        `Format=1`,
+        `Url=${url}`,
+    ].join("\t") + "\r\n";
+    enqueue(sn, cmd);
 
     res.json({ status: "queued", cmdId: cid });
 });
@@ -668,7 +764,7 @@ app.get("/query-users", (req, res) => {
 
     const cid    = getNextCmdId();
     const filter = pin ? `Pin=${pin}` : `*`;
-    enqueue(sn, `C:${cid}:DATA QUERY tablename=user,fielddesc=*,filter=${filter}`);
+    enqueue(sn, `C:${cid}:DATA QUERY tablename=user,fielddesc=*,filter=${filter}\r\n`);
 
     res.json({ status: "queued", cmdId: cid });
 });
@@ -685,7 +781,7 @@ app.get("/open-door", (req, res) => {
     const code    = `0101${doorHex}00${secsHex}`;
     const cid     = getNextCmdId();
 
-    enqueue(sn, `C:${cid}:CONTROL DEVICE ${code}`);
+    enqueue(sn, `C:${cid}:CONTROL DEVICE ${code}\r\n`);
 
     console.log(`🚪 [open-door] SN=${sn} door=${door||1} secs=${seconds||5} code=${code}`);
     res.json({ status: "queued", cmdId: cid, controlCode: code });
@@ -698,7 +794,7 @@ app.get("/reboot-device", (req, res) => {
     if (!sn) return res.status(400).json({ error: "Missing: sn" });
 
     const cid = getNextCmdId();
-    enqueue(sn, `C:${cid}:CONTROL DEVICE 03000000`);
+    enqueue(sn, `C:${cid}:CONTROL DEVICE 03000000\r\n`);
 
     console.log(`🔄 [reboot] SN=${sn}`);
     res.json({ status: "queued", cmdId: cid });
@@ -711,7 +807,7 @@ app.get("/authorize-device", (req, res) => {
     if (!sn || !subSN) return res.status(400).json({ error: "Missing: sn, subSN" });
 
     const cid = getNextCmdId();
-    enqueue(sn, `C:${cid}:DATA UPDATE DeviceAuthorize`, `SN=${subSN}`, `IsAuthorize=${level || "2"}`);
+    enqueue(sn, `C:${cid}:DATA UPDATE DeviceAuthorize\tSN=${subSN}\tIsAuthorize=${level || "2"}\r\n`);
 
     res.json({ status: "queued", cmdId: cid });
 });
@@ -721,7 +817,7 @@ app.get("/deauthorize-device", (req, res) => {
     if (!sn || !subSN) return res.status(400).json({ error: "Missing: sn, subSN" });
 
     const cid = getNextCmdId();
-    enqueue(sn, `C:${cid}:DATA DELETE DeviceAuthorize`, `SN=${subSN}`);
+    enqueue(sn, `C:${cid}:DATA DELETE DeviceAuthorize\tSN=${subSN}\r\n`);
 
     res.json({ status: "queued", cmdId: cid });
 });
