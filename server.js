@@ -136,12 +136,14 @@ app.post("/iclock/getrequest", (req, res) => {
 // ---------------------------------------------------------
 app.get("/add-member", (req, res) => {
   const { sn, id, name } = req.query;
+  if (!sn || !id || !name) {
+    return res.status(400).send("Missing required parameters: sn, id, name");
+  }
+
   const cmdId = Math.floor(Math.random() * 10000);
 
-  // 1. Change USERID to PIN (Critical)
-  // 2. Ensure the command starts with C:ID:DATA UPDATE USER
-  // 3. Use \t (Tabs) as shown in the documentation example
-  const cmd = [
+  // Correct format: each field on a new line after header
+  const cmdLines = [
     `C:${cmdId}:DATA UPDATE USER PIN=${id}`, // Command header
     `Name=${name}`,
     `Pri=0`,
@@ -150,13 +152,15 @@ app.get("/add-member", (req, res) => {
     `Grp=1`,
     `TZ=0000000000000000`,
     `Verify=-1`
-  ].join("\t");
+  ];
+
+  const cmd = cmdLines.join("\r\n"); // ZK firmware prefers CRLF line endings
 
   if (!commandQueue[sn]) commandQueue[sn] = [];
   commandQueue[sn].push(cmd);
 
-  console.log("CORRECTED CMD SENT:", cmd);
-  res.send(`User ${name} queued with PIN ${id}`);
+  console.log(`✅ [ADD MEMBER] Queued for device ${sn}:`, cmd.replace(/\r\n/g, " | "));
+  res.send(`User ${name} (PIN ${id}) queued for device ${sn} with command ID ${cmdId}`);
 });
 
 
@@ -182,6 +186,10 @@ app.get("/query-users", (req, res) => {
     if (!commandQueue[sn]) commandQueue[sn] = [];
     commandQueue[sn].push(cmd);
     res.send(`Query command queued with ID ${cmdId}`);
+});
+
+app.get("/helths", (req, res) => {
+    res.send(`ok`);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
