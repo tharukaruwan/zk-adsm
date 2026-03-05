@@ -142,19 +142,23 @@ app.get("/add-member", (req, res) => {
 
   const cmdId = Math.floor(Math.random() * 10000);
 
-  // Correct format: each field on a new line after header
+  // ZKTeco TA Push Protocol - User creation command
   const cmdLines = [
-    `C:${cmdId}:DATA UPDATE USER PIN=${id}`, // Command header
+    `C:${cmdId}:DATA UPDATE USER`,   // Command header
+    `USER PIN=${id}`,
     `Name=${name}`,
     `Pri=0`,
     `Passwd=`,
     `Card=`,
     `Grp=1`,
     `TZ=0000000000000000`,
-    `Verify=-1`
+    `Verify=-1`,
+    `ViceCard=`,
+    `StartDatetime=0`,
+    `EndDatetime=0`
   ];
 
-  const cmd = cmdLines.join("\r\n"); // ZK firmware prefers CRLF line endings
+  const cmd = cmdLines.join("\r\n"); // CRLF required
 
   if (!commandQueue[sn]) commandQueue[sn] = [];
   commandQueue[sn].push(cmd);
