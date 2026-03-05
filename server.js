@@ -136,36 +136,41 @@ app.post("/iclock/getrequest", (req, res) => {
 // ---------------------------------------------------------
 app.get("/add-member", (req, res) => {
   const { sn, id, name } = req.query;
-  if (!sn || !id || !name) {
-    return res.status(400).send("Missing required parameters: sn, id, name");
-  }
+  if (!sn || !id || !name) return res.status(400).send("Missing sn, id, name");
 
-  const cmdId = Math.floor(Math.random() * 10000); // unique CmdID
+  // Unique CmdIDs
+  const cmdId1 = Math.floor(Math.random() * 10000);
+  const cmdId2 = Math.floor(Math.random() * 10000);
 
-  const cmdLines = [
-    `C:${cmdId}:DATA UPDATE user`,
+  // 1️⃣ Create user
+  const cmdUser = [
+    `C:${cmdId1}:DATA UPDATE user`,
     `USER PIN=${id}`,
     `Name=${name}`,
     `Pri=0`,
     `Passwd=`,
     `Card=`,
     `Grp=1`,
-    `TZ=1`,                    // default full access timezone
+    `TZ=1`,
     `Verify=-1`,
     `ViceCard=`,
     `StartDatetime=0`,
-    `EndDatetime=0`,
-    `AuthorizeTimezoneId=1`,   // AC Push required
-    `AuthorizeDoorId=1`        // AC Push required
-  ];
+    `EndDatetime=0`
+  ].join("\r\n");
 
-  const cmd = cmdLines.join("\r\n"); // CRLF
+  // 2️⃣ Assign access rights
+  const cmdAuthorize = [
+    `C:${cmdId2}:DATA UPDATE userauthorize`,
+    `USER PIN=${id}`,
+    `AuthorizeTimezoneId=1`,
+    `AuthorizeDoorId=1`
+  ].join("\r\n");
 
   if (!commandQueue[sn]) commandQueue[sn] = [];
-  commandQueue[sn].push(cmd);
+  commandQueue[sn].push(cmdUser, cmdAuthorize);
 
-  console.log(`✅ [ADD MEMBER] Queued for device ${sn}:`, cmd.replace(/\r\n/g, " | "));
-  res.send(`User ${name} (PIN ${id}) queued for device ${sn} with command ID ${cmdId}`);
+  console.log(`✅ [ADD MEMBER] Queued for device ${sn}:`, cmdUser.replace(/\r\n/g," | "), " + ", cmdAuthorize.replace(/\r\n/g," | "));
+  res.send(`User ${name} (PIN ${id}) queued with commands ${cmdId1}, ${cmdId2}`);
 });
 
 
