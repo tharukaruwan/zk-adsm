@@ -140,25 +140,26 @@ app.get("/add-member", (req, res) => {
     return res.status(400).send("Missing required parameters: sn, id, name");
   }
 
-  const cmdId = Math.floor(Math.random() * 10000);
+  const cmdId = Math.floor(Math.random() * 10000); // unique CmdID
 
-  // ZKTeco TA Push Protocol - User creation command
   const cmdLines = [
-    `C:${cmdId}:DATA UPDATE USER`,   // Command header
+    `C:${cmdId}:DATA UPDATE user`,
     `USER PIN=${id}`,
     `Name=${name}`,
     `Pri=0`,
     `Passwd=`,
     `Card=`,
     `Grp=1`,
-    `TZ=0000000000000000`,
+    `TZ=1`,                    // default full access timezone
     `Verify=-1`,
     `ViceCard=`,
     `StartDatetime=0`,
-    `EndDatetime=0`
+    `EndDatetime=0`,
+    `AuthorizeTimezoneId=1`,   // AC Push required
+    `AuthorizeDoorId=1`        // AC Push required
   ];
 
-  const cmd = cmdLines.join("\r\n"); // CRLF required
+  const cmd = cmdLines.join("\r\n"); // CRLF
 
   if (!commandQueue[sn]) commandQueue[sn] = [];
   commandQueue[sn].push(cmd);
