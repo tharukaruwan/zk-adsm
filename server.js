@@ -198,6 +198,16 @@ app.get("/query-users", (req, res) => {
     res.send(`Query command queued with ID ${cmdId}`);
 });
 
+app.get("/force-poll", (req, res) => {
+    const { sn } = req.query;
+    if (!sn) return res.send("Missing SN");
+    if (!commandQueue[sn]) return res.send("No commands for SN");
+
+    console.log(`📡 Force poll commands for device ${sn}`);
+    res.set("Content-Type", "text/plain");
+    res.send(commandQueue[sn].join("\r\n") + "\r\n");
+});
+
 app.get("/helths", (req, res) => {
     res.send(`ok`);
 });
